@@ -1,0 +1,72 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
+*.pt
+output/*/
+logs/*.out
+logs/*.err
+
+# Keep structure files
+!output/README.md
+!logs/README.md
+
+# Data
+*.npy
+*.npz
+data/
+Dataset/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cluster/SLURM
+*.out
+*.err
+slurm-*.out
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Reproducibility results
+reproducibility_results_*/

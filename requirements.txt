@@ -1,0 +1,37 @@
+# ExperimentP5 Requirements
+# Clean version for cluster deployment
+
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Diffusion
+imagen-pytorch>=1.24.0
+accelerate>=0.20.0
+einops>=0.6.0
+einops-exts>=0.0.4
+
+# Data Processing
+SimpleITK>=2.2.0
+pydicom>=2.3.0
+pillow>=9.5.0
+opencv-python>=4.7.0
+
+# Visualization & Monitoring
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+psutil>=5.9.0
+pynvml>=11.5.0
+wandb>=0.15.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional (comment out if not needed)
+# tensorboard>=2.13.0
+# module load cuda/11.8
+# module load cudnn/8.6
+# Then: pip install --user -r requirements.txt
