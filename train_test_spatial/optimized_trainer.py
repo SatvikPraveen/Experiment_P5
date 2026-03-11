@@ -154,6 +154,12 @@ class OptimizedDiffusionTrainer:
             # Move to device
             batch = batch.to(self.config.training.device, non_blocking=True).float()
             
+            # DICOM dataset yields (B, C, H, W); sequence data yields (B, T, C, H, W)
+            # Normalise to 5D: (B, T, C, H, W)
+            if batch.dim() == 4:
+                # (B, C, H, W) → (B, 1, C, H, W)
+                batch = batch.unsqueeze(1)
+            
             bsize = batch.shape[0]
             ntime = batch.shape[1]
             H, W = batch.shape[-2], batch.shape[-1]
@@ -194,10 +200,15 @@ class OptimizedDiffusionTrainer:
         Returns:
             Average validation loss
         """
+        self.trainer.eval()
         loss_valid = []
         
         for batch in tqdm(self.valid_loader, desc="Validating"):
             batch = batch.to(self.config.training.device, non_blocking=True).float()
+            
+            # Normalise to 5D: (B, T, C, H, W)
+            if batch.dim() == 4:
+                batch = batch.unsqueeze(1)
             
             bsize = batch.shape[0]
             ntime = batch.shape[1]
@@ -221,6 +232,7 @@ class OptimizedDiffusionTrainer:
             
             loss_valid.append(loss)
         
+        self.trainer.train()
         return sum(loss_valid) / len(loss_valid)
     
     def train(self):
@@ -303,10 +315,9 @@ class OptimizedDiffusionTrainer:
                     log_dict['valid_loss'] = valid_loss
                 self.wandb_run.log(log_dict)
             
-            # Save metrics
-            if epoch % 10 == 0:
-                self.logger.metrics_tracker.save()
-                self.logger.metrics_tracker.plot()
+            # Save metrics every epoch
+            self.logger.metrics_tracker.save()
+            self.logger.metrics_tracker.plot()
         
         print("\n🎉 Training complete!\n")
         
@@ -333,11 +344,6 @@ def create_diffusion_model(config: ExperimentConfig) -> ElucidatedImagen:
         memory_efficient=config.model.memory_efficient,
         dim_mults=config.model.dim_mults
     ).to(torch.device(config.training.device))
-    
-    # Optionally compile (PyTorch 2.0+)
-    if hasattr(torch, 'compile'):
-        print("🔧 Compiling UNet with torch.compile...")
-        unet = torch.compile(unet, mode='reduce-overhead')
     
     # Create Imagen
     imagen = ElucidatedImagen(
