@@ -14,6 +14,12 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
+try:
+    from skimage.metrics import structural_similarity as ssim
+    SSIM_AVAILABLE = True
+except ImportError:
+    SSIM_AVAILABLE = False
+
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -46,77 +52,72 @@ def parse_args():
 def load_model(checkpoint_path, config):
     """Load diffusion model from checkpoint."""
     
-    # Create model
+    # Create model architecture
     imagen = create_diffusion_model(config)
     
-    # Try to load checkpoint
     checkpoint_file = Path(checkpoint_path)
+    
     if checkpoint_file.is_dir():
-        # Try to find model file
-        potential_files = list(checkpoint_file.glob('*.pt'))
-        if not potential_files:
-            raise ValueError(f"No .pt files found in {checkpoint_path}")
-        checkpoint_file = potential_files[0]
-        print(f"Using checkpoint: {checkpoint_file}")
-    
-    print(f"Loading model from {checkpoint_file}")
-    
-    # Load state dict
-    checkpoint = torch.load(checkpoint_file, map_location='cpu')
-    
-    # Handle different checkpoint formats
-    if isinstance(checkpoint, dict):
-        if 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        elif 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
+        # Prefer best_model_sofar inside the directory, fall back to last .pt
+        candidate = checkpoint_file / 'best_model_sofar'
+        if candidate.exists():
+            checkpoint_file = candidate
         else:
-            state_dict = checkpoint
-    else:
-        state_dict = checkpoint
+            pt_files = sorted(checkpoint_file.glob('checkpoint.*.pt'))
+            if not pt_files:
+                raise ValueError(f"No usable checkpoint found in {checkpoint_path}")
+            checkpoint_file = pt_files[-1]  # latest step
     
-    # Load into model (may need to adjust for wrapped models)
+    print(f"Loading checkpoint: {checkpoint_file}")
+    loaded_obj = torch.load(checkpoint_file, map_location='cpu')
+    
+    # ImagenTrainer.save() stores model under 'model' key
+    state_dict = loaded_obj['model'] if isinstance(loaded_obj, dict) and 'model' in loaded_obj else loaded_obj
+    
     try:
         imagen.load_state_dict(state_dict)
     except RuntimeError as e:
         print(f"Warning: {e}")
-        print("Attempting to load with strict=False")
+        print("Attempting strict=False load")
         imagen.load_state_dict(state_dict, strict=False)
     
+    print(f"✅ Model loaded ({sum(p.numel() for p in imagen.parameters())/1e6:.2f}M params)")
     return imagen
 
 
-def generate_samples(imagen, num_samples, device, cond_scale=1.0):
-    """Generate samples from diffusion model."""
+def generate_samples(imagen, cond_images, device, cond_scale=1.0):
+    """
+    Generate samples conditioned on sinogram images.
     
+    Args:
+        cond_images: Sinogram tensors, shape (N, 1, T, H, W_half)
+        Returns generated FBP reconstructions of same shape.
+    """
     imagen.eval()
     imagen.to(device)
+    cond_images = cond_images.to(device)
     
-    print(f"\nGenerating {num_samples} samples...")
+    print(f"\nGenerating {cond_images.shape[0]} samples (cond_scale={cond_scale})...")
     
-    samples = []
+    all_samples = []
+    batch_size = min(4, cond_images.shape[0])
     
+    # T is the time/frame dimension in (B, C, T, H, W)
+    video_frames = cond_images.shape[2]
+
     with torch.no_grad():
-        # Generate in batches
-        batch_size = min(4, num_samples)
-        num_batches = (num_samples + batch_size - 1) // batch_size
-        
-        for i in tqdm(range(num_batches), desc="Generating"):
-            current_batch_size = min(batch_size, num_samples - i * batch_size)
-            
-            # Sample from model
-            # Note: This requires appropriate text/condition input
-            # For unconditional generation:
-            batch_samples = imagen.sample(
-                batch_size=current_batch_size,
+        for start in tqdm(range(0, cond_images.shape[0], batch_size), desc="Generating"):
+            cond_batch = cond_images[start:start + batch_size]
+            samples = imagen.sample(
+                batch_size=cond_batch.shape[0],
+                cond_images=cond_batch,
                 cond_scale=cond_scale,
+                video_frames=video_frames,
                 return_all_unet_outputs=False
             )
-            
-            samples.append(batch_samples.cpu().numpy())
+            all_samples.append(samples.cpu())
     
-    samples = np.concatenate(samples, axis=0)
-    return samples
+    return torch.cat(all_samples, dim=0).numpy()
 
 
 def compute_metrics(generated, targets):
@@ -137,14 +138,25 @@ def compute_metrics(generated, targets):
     max_val = np.max(targets)
     psnr = 10 * np.log10(max_val ** 2 / (mse_per_sample + 1e-10))
     avg_psnr = np.mean(psnr)
-    
-    # SSIM would require skimage
-    
+
+    # SSIM — computed per sample over (H, W), then averaged
+    avg_ssim = None
+    if SSIM_AVAILABLE:
+        ssim_scores = []
+        for i in range(n):
+            # generated/targets shape: (C, H, W); take channel 0
+            g = generated[i, 0].astype(np.float32)
+            t = targets[i, 0].astype(np.float32)
+            data_range = float(max(t.max() - t.min(), 1e-8))
+            ssim_scores.append(ssim(g, t, data_range=data_range))
+        avg_ssim = float(np.mean(ssim_scores))
+
     metrics = {
         'mse': float(mse),
         'mae': float(mae),
         'rmse': float(rmse),
         'psnr': float(avg_psnr),
+        'ssim': avg_ssim,
         'num_samples': n
     }
     
@@ -199,79 +211,90 @@ def main():
     
     # Load config
     if args.config is None:
-        config_path = Path(args.checkpoint).parent / 'config.json'
-        if not config_path.exists():
-            config_path = Path(args.checkpoint) / 'config.json'
-        if not config_path.exists():
-            raise ValueError("Config not found, please specify --config")
-        args.config = str(config_path)
+        ckpt = Path(args.checkpoint)
+        # Search upward from checkpoint location to find config.json
+        search_dirs = [ckpt.parent, ckpt.parent.parent, ckpt.parent.parent.parent]
+        candidates = []
+        for d in search_dirs:
+            candidates += [d / 'logs' / 'config.json', d / 'config.json']
+        candidates.append(ckpt / 'config.json')
+        for candidate in candidates:
+            if candidate.exists():
+                args.config = str(candidate)
+                break
+        if args.config is None:
+            raise ValueError("config.json not found. Pass --config explicitly.")
     
     print(f"Loading config from {args.config}")
     config = ExperimentConfig.load(args.config)
+    config.training.device = args.device
+
+    # The training code splits the image horizontally (left=cond, right=target),
+    # so the model only ever saw width // 2. Override image_width to match.
+    config.data.image_width = config.data.image_width // 2
     
     # Load model
     print("\n" + "="*70)
     print("LOADING MODEL")
     print("="*70)
     imagen = load_model(args.checkpoint, config)
+    imagen.to(args.device)
     
-    # Count parameters
-    total_params = sum(p.numel() for p in imagen.parameters())
-    print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-    
-    # Load data for comparison
+    # Load data
     print("\n" + "="*70)
     print("LOADING DATA")
     print("="*70)
-    dataloaders = create_dataloaders_from_config(config, mode='diffusion')
+    # Use dataset_type from config (already has correct splits saved)
+    mode = config.data.dataset_type if hasattr(config.data, 'dataset_type') else 'diffusion'
+    dataloaders = create_dataloaders_from_config(config, mode=mode)
+    dataloader = dataloaders['valid'] if args.split == 'valid' else dataloaders['train']
     
-    if args.split == 'valid':
-        dataloader = dataloaders['valid']
-    else:
-        dataloader = dataloaders['train']
-    
-    # Get some target samples
-    targets = []
+    # Collect batches — apply same preprocessing as training
+    cond_list, target_list = [], []
     for batch in dataloader:
-        if isinstance(batch, dict):
-            targets.append(batch['target'].numpy())
-        else:
-            _, y = batch
-            targets.append(y.numpy())
-        
-        if len(targets) * config.training.batch_size >= args.num_samples:
+        batch = batch.float()
+        if batch.dim() == 4:          # (B, C, H, W) → (B, 1, C, H, W)
+            batch = batch.unsqueeze(1)
+        H, W = batch.shape[-2], batch.shape[-1]
+        cond   = batch[..., :W//2].permute(0, 2, 1, 3, 4)   # (B,C,T,H,W/2)
+        target = batch[..., W//2:].permute(0, 2, 1, 3, 4)   # (B,C,T,H,W/2)
+        cond_list.append(cond)
+        target_list.append(target)
+        if sum(c.shape[0] for c in cond_list) >= args.num_samples:
             break
     
-    targets = np.concatenate(targets, axis=0)[:args.num_samples]
-    print(f"Loaded {len(targets)} target samples")
+    cond_all   = torch.cat(cond_list,   dim=0)[:args.num_samples]
+    target_all = torch.cat(target_list, dim=0)[:args.num_samples]
+    print(f"Collected {cond_all.shape[0]} samples — cond {tuple(cond_all.shape)}, target {tuple(target_all.shape)}")
     
-    # Generate samples
+    # Generate
     print("\n" + "="*70)
     print("GENERATING SAMPLES")
     print("="*70)
-    
     try:
-        generated = generate_samples(
-            imagen, args.num_samples, args.device, args.cond_scale
-        )
+        generated = generate_samples(imagen, cond_all, args.device, args.cond_scale)
     except Exception as e:
-        print(f"Error during generation: {e}")
-        print("Note: Unconditional generation may require text embeddings.")
-        print("This is a placeholder - adjust based on your model's conditioning.")
-        return
+        print(f"\n❌ Error during generation: {e}")
+        raise
     
-    # Compute metrics
+    # Squeeze time dim for metrics: (B, C, T, H, W) → (B, C, H, W)
+    generated_np = generated[:, :, 0] if generated.ndim == 5 else generated
+    targets_np   = target_all.numpy()[:, :, 0] if target_all.ndim == 5 else target_all.numpy()
+    
+    # Metrics
     print("\n" + "="*70)
-    print("COMPUTING METRICS")
+    print("METRICS")
     print("="*70)
-    
-    metrics = compute_metrics(generated, targets)
-    
-    print(f"Samples evaluated: {metrics['num_samples']}")
-    print(f"MSE:   {metrics['mse']:.6f}")
-    print(f"MAE:   {metrics['mae']:.6f}")
-    print(f"RMSE:  {metrics['rmse']:.6f}")
-    print(f"PSNR:  {metrics['psnr']:.2f} dB")
+    metrics = compute_metrics(generated_np, targets_np)
+    print(f"Samples : {metrics['num_samples']}")
+    print(f"MSE     : {metrics['mse']:.6f}")
+    print(f"MAE     : {metrics['mae']:.6f}")
+    print(f"RMSE    : {metrics['rmse']:.6f}")
+    print(f"PSNR    : {metrics['psnr']:.2f} dB")
+    if metrics['ssim'] is not None:
+        print(f"SSIM    : {metrics['ssim']:.4f}")
+    else:
+        print("SSIM    : N/A (install scikit-image)")
     print("="*70 + "\n")
     
     # Save results
@@ -279,18 +302,16 @@ def main():
         output_dir = Path(args.checkpoint).parent / 'eval_results'
         output_dir.mkdir(exist_ok=True)
         
-        # Save arrays
-        np.save(output_dir / f'generated_{args.split}.npy', generated)
-        np.save(output_dir / f'targets_{args.split}.npy', targets)
+        np.save(output_dir / f'generated_{args.split}.npy',  generated_np)
+        np.save(output_dir / f'targets_{args.split}.npy',    targets_np)
+        np.save(output_dir / f'cond_{args.split}.npy',       cond_all.numpy()[:, :, 0])
         
-        # Save metrics
         with open(output_dir / f'metrics_{args.split}.txt', 'w') as f:
             for key, value in metrics.items():
                 f.write(f"{key}: {value}\n")
         
-        # Visualize
         viz_path = output_dir / f'samples_viz_{args.split}.png'
-        visualize_samples(generated, targets, viz_path)
+        visualize_samples(generated_np, targets_np, viz_path)
         
         print(f"Results saved to {output_dir}")
 

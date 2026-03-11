@@ -317,6 +317,16 @@ class OptimizedDiffusionTrainer:
                     log_dict['valid_loss'] = valid_loss
                 self.wandb_run.log(log_dict)
             
+            # Interval checkpoint save
+            if self.config.training.save_every > 0 and (epoch + 1) % self.config.training.save_every == 0:
+                ckpt_path = os.path.join(
+                    self.config.checkpoint_dir,
+                    f'checkpoint_epoch_{epoch + 1:04d}'
+                )
+                self.trainer.save(ckpt_path)
+                np.savetxt(ckpt_path + '_epoch', np.ones(2) * epoch)
+                print(f"💾 Checkpoint saved at epoch {epoch + 1} → {ckpt_path}")
+
             # Save metrics every epoch
             self.logger.metrics_tracker.save()
             self.logger.metrics_tracker.plot()

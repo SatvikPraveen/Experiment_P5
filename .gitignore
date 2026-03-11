@@ -38,11 +38,17 @@ logs/*.err
 !output/README.md
 !logs/README.md
 
-# Data
+# Data — ignore large binary/dataset files but keep Python source files
 *.npy
 *.npz
-data/
-Dataset/
+data_1/
+data_2/
+data/Dataset/
+data/sino_cache/
+data/fbp_cache/
+data/extra_data/
+data/test_data/
+data/__pycache__/
 
 # Jupyter Notebook
 .ipynb_checkpoints

@@ -73,6 +73,8 @@ def parse_args():
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable mixed precision')
     parser.set_defaults(amp=None)
     parser.add_argument('--resume', type=str, help='Resume from checkpoint')
+    parser.add_argument('--save_every', type=int, default=None,
+                        help='Save a checkpoint every N epochs (e.g. 10 → saves at epoch 10, 20, 30, ...)')
     parser.add_argument('--seed', type=int, help='Random seed for reproducibility')
     parser.add_argument('--output_dir', type=str, help='Output directory for checkpoints and logs')
     
@@ -145,10 +147,13 @@ def main():
     # DICOM + FBP mode overrides
     if args.dicom:
         config.data.dataset_type = 'dicom_fbp'
-        if args.dicom_path:
-            config.data.dicom_path = args.dicom_path
-        # Clamp splits to the number of available DICOM slices (133)
-        _TOTAL_DICOM_SLICES = len(list(__import__('pathlib').Path(config.data.dicom_path).glob('*.dcm')))
+    if args.dicom_path:
+        config.data.dicom_path = args.dicom_path
+    if config.data.dataset_type == 'dicom_fbp':
+        # Count all .dcm files across all series in the directory — matches
+        # _load_dicom_series which concatenates every series (1 file = 1 slice)
+        from pathlib import Path as _Path
+        _TOTAL_DICOM_SLICES = len(list(_Path(config.data.dicom_path).glob('*.dcm')))
         config.data.train_start = 0
         config.data.train_span = int(_TOTAL_DICOM_SLICES * 0.75)
         config.data.valid_start = config.data.train_span
@@ -164,6 +169,9 @@ def main():
     set_random_seed(config.training.random_seed, config.training.deterministic)
     
     # Debug mode
+    if args.save_every is not None:
+        config.training.save_every = args.save_every
+
     if args.debug:
         config.training.epoch_num = 2
         config.training.save_every = 1

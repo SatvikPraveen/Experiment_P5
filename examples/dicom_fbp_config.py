@@ -26,12 +26,13 @@ def get_dicom_fbp_config():
             dicom_path='data/Dataset',  # Path to DICOM files
             
             # Dataset splits (in number of slices)
+            # Sized for a ~133-slice DICOM volume
             train_start=0,
-            train_span=80,   # First 80 slices for training
-            valid_start=80,
-            valid_span=20,   # Next 20 for validation  
-            test_start=100,
-            test_span=33,    # Remaining for testing
+            train_span=100,  # First 100 slices for training
+            valid_start=100,
+            valid_span=20,   # Next 20 for validation
+            test_start=120,
+            test_span=13,    # Remaining for testing
             
             # Image dimensions
             image_height=512,
