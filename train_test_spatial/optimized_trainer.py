@@ -93,6 +93,8 @@ class OptimizedDiffusionTrainer:
             precision = 'no'
             fp16 = False
         
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        
         trainer = ImagenTrainer(
             self.imagen,
             device=torch.device(self.config.training.device),
@@ -124,7 +126,7 @@ class OptimizedDiffusionTrainer:
             accelerate_split_batches=True,
             accelerate_mixed_precision=precision,
             
-            # Checkpointing
+            # Checkpointing (ensure dir exists before ImagenTrainer init)
             checkpoint_path=self.config.checkpoint_dir,
             checkpoint_every=self.config.training.save_every * len(self.train_loader),
             max_checkpoints_keep=self.config.training.keep_last_n_checkpoints,

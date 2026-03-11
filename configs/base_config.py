@@ -184,14 +184,12 @@ class ExperimentConfig:
         """Setup output directories"""
         if not self.output_dir:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.output_dir = f'./output/{self.name}_{timestamp}'
+            self.output_dir = f'./output/{self.name}/run_{timestamp}'
         
         self.checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
         self.log_dir = os.path.join(self.output_dir, 'logs')
-        
-        # Create directories
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        os.makedirs(self.log_dir, exist_ok=True)
+        # Directories are created lazily (set_output_dir or first save/train call)
+        # to avoid ghost directories when --output_dir overrides the auto path.
     
     def set_output_dir(self, output_dir: str):
         """Override output directory and re-derive checkpoint/log paths"""
@@ -205,6 +203,8 @@ class ExperimentConfig:
         """Save configuration to JSON"""
         if path is None:
             path = os.path.join(self.log_dir, 'config.json')
+        
+        os.makedirs(self.log_dir, exist_ok=True)
         
         # Convert to dict
         config_dict = {
