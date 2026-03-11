@@ -63,24 +63,32 @@ def parse_args():
     # Override options
     parser.add_argument('--name', type=str, help='Experiment name')
     parser.add_argument('--batch_size', type=int, help='Training batch size')
+    parser.add_argument('--batch_size_valid', type=int, help='Validation batch size (defaults to training batch size)')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--lr', type=float, help='Learning rate')
     parser.add_argument('--device', type=str, help='Device (cuda:0, cuda:1, etc.)')
     parser.add_argument('--num_workers', type=int, help='DataLoader workers')
     parser.add_argument('--unet_dim', type=int, help='UNet base dimension')
-    parser.add_argument('--amp', action='store_true', help='Enable mixed precision')
+    parser.add_argument('--amp', action='store_true', default=None, help='Enable mixed precision')
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable mixed precision')
+    parser.set_defaults(amp=None)
     parser.add_argument('--resume', type=str, help='Resume from checkpoint')
     parser.add_argument('--seed', type=int, help='Random seed for reproducibility')
+    parser.add_argument('--output_dir', type=str, help='Output directory for checkpoints and logs')
     
     # Wandb
     parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
     parser.add_argument('--no-wandb', action='store_false', dest='wandb', help='Disable wandb logging')
+    parser.set_defaults(wandb=None)
     parser.add_argument('--wandb_project', type=str, help='Wandb project name')
     parser.add_argument('--wandb_entity', type=str, help='Wandb entity (username/team)')
     
     # Multi-GPU
     parser.add_argument('--multi_gpu', action='store_true', help='Enable multi-GPU training')
+    
+    # DICOM + FBP mode
+    parser.add_argument('--dicom', action='store_true', help='Use DICOM+FBP pipeline instead of .npy data')
+    parser.add_argument('--dicom_path', type=str, default=None, help='Path to DICOM series directory (default: data/Dataset)')
     
     # Debugging
     parser.add_argument('--debug', action='store_true', help='Debug mode (single epoch)')
@@ -105,6 +113,8 @@ def main():
         config.name = args.name
     if args.batch_size:
         config.training.batch_size = args.batch_size
+    if args.batch_size_valid:
+        config.training.batch_size_valid = args.batch_size_valid
     if args.epochs:
         config.training.epoch_num = args.epochs
     if args.lr:
@@ -123,12 +133,32 @@ def main():
         config.training.use_multi_gpu = True
     if args.seed is not None:
         config.training.random_seed = args.seed
+    if args.output_dir:
+        config.set_output_dir(args.output_dir)
     if args.wandb is not None:
         config.training.use_wandb = args.wandb
     if args.wandb_project:
         config.training.wandb_project = args.wandb_project
     if args.wandb_entity:
         config.training.wandb_entity = args.wandb_entity
+    
+    # DICOM + FBP mode overrides
+    if args.dicom:
+        config.data.dataset_type = 'dicom_fbp'
+        if args.dicom_path:
+            config.data.dicom_path = args.dicom_path
+        # Clamp splits to the number of available DICOM slices (133)
+        _TOTAL_DICOM_SLICES = len(list(__import__('pathlib').Path(config.data.dicom_path).glob('*.dcm')))
+        config.data.train_start = 0
+        config.data.train_span = int(_TOTAL_DICOM_SLICES * 0.75)
+        config.data.valid_start = config.data.train_span
+        config.data.valid_span = int(_TOTAL_DICOM_SLICES * 0.15)
+        config.data.test_start = config.data.valid_start + config.data.valid_span
+        config.data.test_span = _TOTAL_DICOM_SLICES - config.data.test_start
+        print(f"\n🏥 DICOM mode: {_TOTAL_DICOM_SLICES} slices from {config.data.dicom_path}")
+        print(f"   Train: {config.data.train_start}→{config.data.train_start + config.data.train_span}")
+        print(f"   Valid: {config.data.valid_start}→{config.data.valid_start + config.data.valid_span}")
+        print(f"   Test:  {config.data.test_start}→{config.data.test_start + config.data.test_span}\n")
     
     # Set random seed for reproducibility
     set_random_seed(config.training.random_seed, config.training.deterministic)
@@ -190,7 +220,7 @@ def main():
     
     # Create dataloaders
     print("\n📊 Creating dataloaders...")
-    dataloaders = create_dataloaders_from_config(config, mode='diffusion')
+    dataloaders = create_dataloaders_from_config(config, mode=config.data.dataset_type if config.data.dataset_type == 'dicom_fbp' else 'diffusion')
     train_loader = dataloaders['train']
     valid_loader = dataloaders['valid']
     

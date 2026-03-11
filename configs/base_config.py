@@ -193,6 +193,14 @@ class ExperimentConfig:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
     
+    def set_output_dir(self, output_dir: str):
+        """Override output directory and re-derive checkpoint/log paths"""
+        self.output_dir = output_dir
+        self.checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
+        self.log_dir = os.path.join(self.output_dir, 'logs')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+
     def save(self, path: Optional[str] = None):
         """Save configuration to JSON"""
         if path is None:
