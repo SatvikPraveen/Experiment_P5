@@ -49,6 +49,7 @@ data/fbp_cache/
 data/extra_data/
 data/test_data/
 data/__pycache__/
+data_old/
 
 # Jupyter Notebook
 .ipynb_checkpoints
