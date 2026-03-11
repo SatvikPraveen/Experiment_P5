@@ -15,6 +15,7 @@ einops-exts>=0.0.4
 
 # Data Processing
 SimpleITK>=2.2.0
+astra-toolbox>=2.1.0
 pydicom>=2.3.0
 pillow>=9.5.0
 opencv-python>=4.7.0
