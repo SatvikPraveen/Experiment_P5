@@ -10,6 +10,7 @@ This module provides high-performance data loading with:
 - Both BFS and DICOM datasets
 """
 
+import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -177,19 +178,23 @@ class DICOMDataset(Dataset):
         if cache_only:
             if self.cache_dir is None:
                 raise ValueError("cache_only=True requires cache_dir to be set")
-            i = 0
-            while True:
-                actual_index = start_n + i
-                cache_path = (
-                    self.cache_dir
-                    / f"sino_s0_i{actual_index}_d{det_tag}_a{self.angle_step:.4f}.npy"
-                )
-                if not cache_path.exists():
-                    break
-                self.index_map.append(cache_path)
-                i += 1
-                if n_samples is not None and i >= n_samples:
-                    break
+            import re as _re
+            # Collect sinograms from ALL series in the cache directory, sorted
+            # by (series_id, slice_id) to form a single flat index space.
+            _pat = _re.compile(
+                rf"sino_s(\d+)_i(\d+)_d{_re.escape(str(det_tag))}_a{self.angle_step:.4f}\.npy"
+            )
+            all_files = []
+            for _f in self.cache_dir.iterdir():
+                _m = _pat.match(_f.name)
+                if _m:
+                    all_files.append((int(_m.group(1)), int(_m.group(2)), _f))
+            all_files.sort(key=lambda x: (x[0], x[1]))
+            # Apply start_n / n_samples as a slice into the flat list
+            subset = all_files[start_n:]
+            if n_samples is not None:
+                subset = subset[:n_samples]
+            self.index_map = [_f for _, _, _f in subset]
             if not self.index_map:
                 raise FileNotFoundError(
                     f"No cached sinograms found in {self.cache_dir} starting at "

@@ -152,17 +152,28 @@ def main():
     if args.dicom_path:
         config.data.dicom_path = args.dicom_path
     if config.data.dataset_type in ('dicom_fbp', 'dicom_sino'):
-        # Count all .dcm files across all series in the directory — matches
-        # _load_dicom_series which concatenates every series (1 file = 1 slice)
         from pathlib import Path as _Path
-        _TOTAL_DICOM_SLICES = len(list(_Path(config.data.dicom_path).glob('*.dcm')))
+        # If a pre-built sino_cache exists, derive splits from the number of
+        # consecutive series-0 files (sino_s0_i<N>_...) — which is exactly
+        # what DICOMDataset iterates in cache_only mode.  Counting all *.npy
+        # files is wrong because the cache may hold multiple series.
+        _sino_cache = getattr(config.data, 'sino_cache_dir', 'data/sino_cache')
+        _npy_count = 0
+        if _sino_cache and _Path(_sino_cache).is_dir():
+            _npy_count = sum(1 for f in os.listdir(_sino_cache) if f.endswith('.npy'))
+        if _npy_count > 0:
+            _TOTAL_SLICES = _npy_count
+            print(f"\n🏥 DICOM mode (sino_cache): {_TOTAL_SLICES} total sinograms in {_sino_cache}")
+        else:
+            # Fall back to counting .dcm files when no cache exists
+            _TOTAL_SLICES = len(list(_Path(config.data.dicom_path).glob('*.dcm')))
+            print(f"\n🏥 DICOM mode: {_TOTAL_SLICES} slices from {config.data.dicom_path}")
         config.data.train_start = 0
-        config.data.train_span = int(_TOTAL_DICOM_SLICES * 0.75)
+        config.data.train_span = int(_TOTAL_SLICES * 0.75)
         config.data.valid_start = config.data.train_span
-        config.data.valid_span = int(_TOTAL_DICOM_SLICES * 0.15)
+        config.data.valid_span = int(_TOTAL_SLICES * 0.15)
         config.data.test_start = config.data.valid_start + config.data.valid_span
-        config.data.test_span = _TOTAL_DICOM_SLICES - config.data.test_start
-        print(f"\n🏥 DICOM mode: {_TOTAL_DICOM_SLICES} slices from {config.data.dicom_path}")
+        config.data.test_span = _TOTAL_SLICES - config.data.test_start
         print(f"   Train: {config.data.train_start}→{config.data.train_start + config.data.train_span}")
         print(f"   Valid: {config.data.valid_start}→{config.data.valid_start + config.data.valid_span}")
         print(f"   Test:  {config.data.test_start}→{config.data.test_start + config.data.test_span}\n")
