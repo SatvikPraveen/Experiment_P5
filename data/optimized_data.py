@@ -140,7 +140,8 @@ class DICOMDataset(Dataset):
         angle_step: Optional[float] = None,
         cache_dir: Optional[str] = None,
         start_n: int = 0,
-        n_samples: Optional[int] = None
+        n_samples: Optional[int] = None,
+        cache_only: bool = False
     ):
         """
         Args:
@@ -150,6 +151,9 @@ class DICOMDataset(Dataset):
             cache_dir: Directory to cache processed sinograms
             start_n: Starting slice index
             n_samples: Number of samples to use (all if None)
+            cache_only: If True, build index_map entirely from existing cache files
+                        without loading DICOM or running ASTRA at all.  Raises
+                        FileNotFoundError if expected cache files are missing.
         """
         if not DICOM_AVAILABLE:
             raise ImportError("DICOM functionality requires SimpleITK and ASTRA")
@@ -165,6 +169,39 @@ class DICOMDataset(Dataset):
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         det_tag = detector_count if detector_count is not None else 'auto'
+
+        # ------------------------------------------------------------------
+        # Cache-only fast path: build index_map directly from existing .npy
+        # files without touching DICOM or ASTRA.
+        # ------------------------------------------------------------------
+        if cache_only:
+            if self.cache_dir is None:
+                raise ValueError("cache_only=True requires cache_dir to be set")
+            i = 0
+            while True:
+                actual_index = start_n + i
+                cache_path = (
+                    self.cache_dir
+                    / f"sino_s0_i{actual_index}_d{det_tag}_a{self.angle_step:.4f}.npy"
+                )
+                if not cache_path.exists():
+                    break
+                self.index_map.append(cache_path)
+                i += 1
+                if n_samples is not None and i >= n_samples:
+                    break
+            if not self.index_map:
+                raise FileNotFoundError(
+                    f"No cached sinograms found in {self.cache_dir} starting at "
+                    f"index {start_n} (expected pattern: sino_s0_i<N>_d{det_tag}_"
+                    f"a{self.angle_step:.4f}.npy).\n"
+                    f"Run  python data/dicom_preprocess.py  first to generate the cache."
+                )
+            print(
+                f"⚡ Cache-only mode: {len(self.index_map)} sinograms "
+                f"loaded from {self.cache_dir} (no DICOM/ASTRA needed)"
+            )
+            return  # skip all DICOM loading below
 
         # Lazily load DICOM volume — only when a cache miss requires it
         _volume = None
@@ -185,7 +222,9 @@ class DICOMDataset(Dataset):
             actual_index = start_n + i
 
             if self.cache_dir:
-                cache_path = self.cache_dir / f"sino_i{actual_index}_d{det_tag}_a{self.angle_step:.4f}.npy"
+                # Naming matches dicom_preprocess.py (sino_s0_i<N>_...) so that
+                # pre-generated caches are found on the first run.
+                cache_path = self.cache_dir / f"sino_s0_i{actual_index}_d{det_tag}_a{self.angle_step:.4f}.npy"
 
                 if cache_path.exists():
                     # Cache hit — bypass DICOM loading entirely
@@ -406,9 +445,10 @@ def create_dataloaders_from_config(config, mode='sequential'):
             use_cache=config.data.cache_fbp
         )
     
-    elif mode == 'sequential' or dataset_type == 'bfs':
-        # BFS dataset for sequential training
-        print(f"📊 Using BFS sequential dataset")
+    elif mode == 'diffusion' or mode == 'sequential' or dataset_type == 'bfs':
+        # BFS dataset for sequential and diffusion training
+        # 'diffusion' mode trains the spatial diffusion model on the same BFS sinogram data
+        print(f"📊 Using BFS dataset (mode={mode})")
         
         train_dataset = BFSDataset(
             data_location=config.data.data_location,
@@ -437,6 +477,62 @@ def create_dataloaders_from_config(config, mode='sequential'):
             preload=False
         )
     
+    elif mode == 'dicom_sino' or dataset_type == 'dicom_sino':
+        # Raw sinogram pipeline for sparse-view CT reconstruction.
+        # DICOMDataset generates full sinograms via ASTRA forward projection;
+        # the diffusion trainer builds masked conditioning on-the-fly.
+        #
+        # FAST PATH: if sino_cache_dir already contains .npy files produced
+        # by dicom_preprocess.py, use cache_only=True to skip all DICOM/ASTRA
+        # work entirely — just load the .npy files directly.
+        _sino_cache = getattr(config.data, 'sino_cache_dir', 'data/sino_cache')
+        _cache_ready = (
+            _sino_cache
+            and os.path.isdir(_sino_cache)
+            and any(f.endswith('.npy') for f in os.listdir(_sino_cache))
+        )
+        if _cache_ready:
+            print(f"⚡ sino_cache detected at '{_sino_cache}' — skipping DICOM loading")
+        else:
+            if not DICOM_AVAILABLE:
+                raise ImportError(
+                    "dicom_sino mode requires SimpleITK and ASTRA (no pre-built cache found). "
+                    "Install SimpleITK with: pip install SimpleITK; "
+                    "follow ASTRA Toolbox installation docs for GPU support. "
+                    "Or run  python data/dicom_preprocess.py  to pre-generate the cache."
+                )
+            print(f"📊 Using DICOM sinogram pipeline (mode={mode}) — will build cache")
+
+        train_dataset = DICOMDataset(
+            series_path=config.data.dicom_path,
+            detector_count=config.data.detector_count,
+            angle_step=config.data.angle_step,
+            cache_dir=_sino_cache,
+            start_n=config.data.train_start,
+            n_samples=config.data.train_span,
+            cache_only=_cache_ready,
+        )
+
+        valid_dataset = DICOMDataset(
+            series_path=config.data.dicom_path,
+            detector_count=config.data.detector_count,
+            angle_step=config.data.angle_step,
+            cache_dir=_sino_cache,
+            start_n=config.data.valid_start,
+            n_samples=config.data.valid_span,
+            cache_only=_cache_ready,
+        )
+
+        test_dataset = DICOMDataset(
+            series_path=config.data.dicom_path,
+            detector_count=config.data.detector_count,
+            angle_step=config.data.angle_step,
+            cache_dir=_sino_cache,
+            start_n=config.data.test_start,
+            n_samples=config.data.test_span,
+            cache_only=_cache_ready,
+        )
+
     else:
         raise ValueError(f"Unknown mode: {mode}, dataset_type: {dataset_type}")
     

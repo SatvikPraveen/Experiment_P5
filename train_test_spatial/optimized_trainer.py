@@ -12,6 +12,7 @@ Features:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 import os
 import sys
@@ -136,7 +137,77 @@ class OptimizedDiffusionTrainer:
         )
         
         return trainer
-    
+
+    # ------------------------------------------------------------------
+    # Sparse-view CT helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pad_h16(t: torch.Tensor) -> torch.Tensor:
+        """Pad the HEIGHT axis to the nearest multiple of 16 (UNet requirement)."""
+        h = t.shape[-2]
+        pad_h = (16 - h % 16) % 16
+        if pad_h > 0:
+            B_, T_, C_, H_, W_ = t.shape
+            t = t.reshape(B_ * T_, C_, H_, W_)
+            t = F.pad(t, (0, 0, 0, pad_h), mode='reflect')
+            t = t.reshape(B_, T_, C_, H_ + pad_h, W_)
+        return t
+
+    def _apply_sparse_split(self, batch: torch.Tensor):
+        """
+        Build (cond_masked, target) for sparse-view CT sinogram inpainting.
+
+        Both returned tensors have the **same** spatial size — the full sinogram
+        height padded to a multiple of 16.  The condition is a zeros-masked copy
+        where only the sampled projection angles are filled in; the target is the
+        complete (unmasked) padded sinogram.  Equal spatial dimensions are required
+        so the condition can be concatenated channel-wise inside the 3D UNet
+        (Unet3D prepends cond_images to x via torch.cat along dim=1).
+
+        Returns
+        -------
+        batch_cond   – masked sinogram, zeros at unknown angles  [B, T, C, H_pad, W]
+        batch_target – full sinogram                             [B, T, C, H_pad, W]
+        """
+        H = batch.shape[-2]
+        strategy = self.config.data.sparse_strategy
+
+        # Pad the full sinogram once (target); 720 and 1024 are already multiples
+        # of 16, so _pad_h16 is effectively a no-op for standard CT geometries.
+        batch_target = self._pad_h16(batch)
+
+        # Build a zeros-masked condition of the same shape
+        batch_cond = torch.zeros_like(batch_target)
+
+        if strategy == 'angle_25pct':
+            # Every 4th angle is a known measurement
+            cond_indices = list(range(0, H, 4))
+        elif strategy == 'angle_12pct':
+            # Every 8th angle is a known measurement
+            cond_indices = list(range(0, H, 8))
+        elif strategy == 'angle_block_50pct':
+            # First contiguous half of angles are known
+            cond_indices = list(range(0, H // 2))
+        elif strategy == 'angle_step_50pct':
+            # Every other angle (even rows) is known
+            cond_indices = list(range(0, H, 2))
+        elif strategy == 'angle_limited_25pct':
+            # Every 4th angle within the first 75 % of the angular range is known
+            first_75 = int(H * 0.75)
+            cond_indices = list(range(0, first_75, 4))
+        else:
+            raise ValueError(
+                f"Unknown sparse_strategy '{strategy}'. "
+                f"Choose from: angle_25pct, angle_12pct, angle_block_50pct, "
+                f"angle_step_50pct, angle_limited_25pct"
+            )
+
+        # Fill in the known projection angles; padding rows stay zero
+        batch_cond[..., cond_indices, :] = batch_target[..., cond_indices, :]
+
+        return batch_cond, batch_target
+
     def train_epoch(self, epoch: int) -> float:
         """
         Train for one epoch.
@@ -162,18 +233,13 @@ class OptimizedDiffusionTrainer:
                 # (B, C, H, W) → (B, 1, C, H, W)
                 batch = batch.unsqueeze(1)
             
-            bsize = batch.shape[0]
-            ntime = batch.shape[1]
-            H, W = batch.shape[-2], batch.shape[-1]
-            
-            # Split: left half = condition, right half = target
-            batch_cond = batch[..., :W//2]
-            batch = batch[..., W//2:]
-            
+            # Split sinogram into (condition, target) using the configured sparse strategy
+            batch_cond, batch = self._apply_sparse_split(batch)
+
             # Permute to [B, C, T, H, W]
             batch = batch.permute([0, 2, 1, 3, 4])
             batch_cond = batch_cond.permute([0, 2, 1, 3, 4])
-            
+
             # Training step (trainer handles AMP, gradient accumulation, etc.)
             loss = self.trainer(
                 batch,
@@ -212,18 +278,13 @@ class OptimizedDiffusionTrainer:
             if batch.dim() == 4:
                 batch = batch.unsqueeze(1)
             
-            bsize = batch.shape[0]
-            ntime = batch.shape[1]
-            H, W = batch.shape[-2], batch.shape[-1]
-            
-            # Split
-            batch_cond = batch[..., :W//2]
-            batch = batch[..., W//2:]
-            
+            # Split using configured sparse strategy
+            batch_cond, batch = self._apply_sparse_split(batch)
+
             # Permute
             batch = batch.permute([0, 2, 1, 3, 4])
             batch_cond = batch_cond.permute([0, 2, 1, 3, 4])
-            
+
             # Evaluate
             loss = self.trainer(
                 batch,

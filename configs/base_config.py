@@ -44,13 +44,23 @@ class DataConfig:
     # Detector configuration (for CT/DICOM)
     detector_count: int = 816  # Number of detector elements
     angle_step: float = 0.5  # Angular step in degrees (e.g., 0.5 for 720 projections)
-    
+
+    # Sparse-view split strategy (governs how condition / target are split in the diffusion trainer)
+    # Options:
+    #   'angle_25pct'         – every 4th row is condition, rest (75 %) are target        [0::4]
+    #   'angle_12pct'         – every 8th row is condition, rest (87.5 %) are target      [0::8]
+    #   'angle_block_50pct'   – top half is condition, bottom half is target               [H//2]
+    #   'angle_step_50pct'    – every other row is condition, odd rows are target          [0::2]
+    #   'angle_limited_25pct' – every 4th row in the first 75 % of rows is condition
+    sparse_strategy: str = 'angle_25pct'
+
     # FBP reconstruction settings
     use_fbp: bool = True  # Apply FBP reconstruction
     fbp_filter: str = 'Ram-Lak'  # FBP filter type: Ram-Lak, Shepp-Logan, Cosine, etc.
     cache_fbp: bool = True  # Cache FBP reconstructions
-    cache_dir: Optional[str] = 'data/fbp_cache'  # Cache directory
-    
+    cache_dir: Optional[str] = 'data/fbp_cache'  # FBP cache directory (for dicom_fbp mode)
+    sino_cache_dir: str = 'data/sino_cache'  # Sinogram cache directory (for dicom_sino mode)
+
     # Data loading
     num_workers: int = 4
     pin_memory: bool = True
@@ -287,7 +297,7 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
     - 'updated_1024': Highest resolution (1024×512)
     - 'feather_720_432': Feather aspect ratio
     """
-    
+    # not needed
     if preset_name == 'baseline':
         return ExperimentConfig(
             name='baseline_main_branch',
@@ -306,7 +316,7 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
                 use_amp=False  # Original didn't use AMP
             )
         )
-
+    # not needed
     elif preset_name == 'baseline_optimized':
         return ExperimentConfig(
             name='baseline_optimized',
@@ -333,7 +343,7 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
             name='720_816_standard',
             description='Standard 720×816 configuration with optimizations',
             data=DataConfig(
-                image_height=368,
+                image_height=720,  # full sinogram height — masked conditioning keeps cond and target the same size
                 image_width=816,
                 detector_count=816,
                 angle_step=360/720
@@ -354,8 +364,8 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
             name='720_816_high_capacity',
             description='High capacity UNet (dim=128) for better quality',
             data=DataConfig(
-                image_height=720,
-                image_width=416,
+                image_height=720,  # full sinogram height — masked conditioning keeps cond and target the same size
+                image_width=816,
                 detector_count=816,
                 angle_step=360/720
             ),
@@ -376,8 +386,8 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
             name='720_816_medium_capacity',
             description='Medium capacity UNet (dim=64) - balanced',
             data=DataConfig(
-                image_height=720,
-                image_width=416,
+                image_height=720,  # full sinogram height — masked conditioning keeps cond and target the same size
+                image_width=816,
                 detector_count=816,
                 angle_step=360/720
             ),
@@ -391,13 +401,13 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
                 use_amp=True
             )
         )
-    
+    # not needed
     elif preset_name == 'updated_1024':
         return ExperimentConfig(
             name='updated_1024_512',
             description='Highest resolution (1024×512) configuration',
             data=DataConfig(
-                image_height=1024,
+                image_height=1024,  # full sinogram height (1024 angles, 1024%16=0)
                 image_width=512,
                 detector_count=1024,
                 angle_step=360/1024,
@@ -414,13 +424,13 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
                 gradient_accumulation_steps=2
             )
         )
-    
+    # not needed
     elif preset_name == 'feather_720_432':
         return ExperimentConfig(
             name='feather_aspect_ratio',
             description='Feather aspect ratio experiment (720×448)',
             data=DataConfig(
-                image_height=720,
+                image_height=720,  # full sinogram height — masked conditioning keeps cond and target the same size
                 image_width=448,
                 detector_count=816,
                 angle_step=360/720
@@ -441,8 +451,8 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
             name='optimized_default',
             description='Recommended default with all optimizations',
             data=DataConfig(
-                image_height=720,
-                image_width=416,
+                image_height=720,  # full sinogram height — masked conditioning keeps cond and target the same size
+                image_width=816,
                 detector_count=816,
                 angle_step=360/720,
                 num_workers=8  # Maximize data loading
@@ -461,11 +471,110 @@ def get_preset_config(preset_name: str) -> ExperimentConfig:
             )
         )
     
+    elif preset_name == '720_816_12pct':
+        return ExperimentConfig(
+            name='720_816_12.5pct_sparse',
+            description='12.5 % sparse-view CT: every 8th projection angle as condition '
+                        '(90/720 rows); 630 target rows padded to 640. '
+                        'Matches the 720_816_12.5% G-LED branch.',
+            data=DataConfig(
+                image_height=720,   # full sinogram height (720 angles, 720%16=0)
+                image_width=816,
+                detector_count=816,
+                angle_step=360/720,
+                sparse_strategy='angle_12pct'
+            ),
+            model=ModelConfig(
+                unet_dim=32,
+                dim_mults=(1, 2, 4, 8)
+            ),
+            training=TrainingConfig(
+                batch_size=8,
+                epoch_num=500,
+                use_amp=True
+            )
+        )
+    # not needed
+    elif preset_name == '720_816_angle_block_50':
+        return ExperimentConfig(
+            name='720_816_angle_block_50pct',
+            description='50 % sparse-view CT — contiguous block split: top 360 rows are '
+                        'the known (condition) projections; bottom 360 rows are the target; '
+                        'padded to 368. Matches the 720_816_model_angle_block G-LED branch.',
+            data=DataConfig(
+                image_height=720,   # full sinogram height (720 angles, 720%16=0)
+                image_width=816,
+                detector_count=816,
+                angle_step=360/720,
+                sparse_strategy='angle_block_50pct'
+            ),
+            model=ModelConfig(
+                unet_dim=32,
+                dim_mults=(1, 2, 4, 8)
+            ),
+            training=TrainingConfig(
+                batch_size=8,
+                epoch_num=500,
+                use_amp=True
+            )
+        )
+
+    elif preset_name == '720_816_angle_step_50':
+        return ExperimentConfig(
+            name='720_816_angle_step_50pct',
+            description='50 % sparse-view CT — interleaved step split: even-indexed rows '
+                        'are the known (condition) projections; odd-indexed rows are the '
+                        'target; 360 target rows padded to 368. '
+                        'Matches the 720_816_model_angle_step G-LED branch.',
+            data=DataConfig(
+                image_height=720,   # full sinogram height (720 angles, 720%16=0)
+                image_width=816,
+                detector_count=816,
+                angle_step=360/720,
+                sparse_strategy='angle_step_50pct'
+            ),
+            model=ModelConfig(
+                unet_dim=32,
+                dim_mults=(1, 2, 4, 8)
+            ),
+            training=TrainingConfig(
+                batch_size=8,
+                epoch_num=500,
+                use_amp=True
+            )
+        )
+
+    elif preset_name == '720_816_limited_view':
+        return ExperimentConfig(
+            name='720_816_limited_view_25pct',
+            description='Limited-view sparse CT: every 4th row within the first 75 % of '
+                        'projection angles is the condition (135 rows); the remaining 585 '
+                        'rows are the target, padded to 592. '
+                        'Matches the 720_816_25%_limited_view G-LED branch.',
+            data=DataConfig(
+                image_height=720,   # full sinogram height (720 angles, 720%16=0)
+                image_width=816,
+                detector_count=816,
+                angle_step=360/720,
+                sparse_strategy='angle_limited_25pct'
+            ),
+            model=ModelConfig(
+                unet_dim=32,
+                dim_mults=(1, 2, 4, 8)
+            ),
+            training=TrainingConfig(
+                batch_size=8,
+                epoch_num=500,
+                use_amp=True
+            )
+        )
+
     else:
         raise ValueError(
             f"Unknown preset: {preset_name}. "
             f"Available: baseline, baseline_optimized, 720_816_standard, 720_816_high_unet, "
-            f"720_816_medium_unet, updated_1024, feather_720_432, optimized_default"
+            f"720_816_medium_unet, updated_1024, feather_720_432, optimized_default, "
+            f"720_816_12pct, 720_816_angle_block_50, 720_816_angle_step_50, 720_816_limited_view"
         )
 
 

@@ -144,12 +144,14 @@ def main():
     if args.wandb_entity:
         config.training.wandb_entity = args.wandb_entity
     
-    # DICOM + FBP mode overrides
+    # DICOM mode: use raw sinograms (dicom_sino) for the sparse-view CT
+    # projection-angle reconstruction task.  dicom_fbp (FBP pixel images)
+    # is a separate image-domain pipeline and must NOT be used here.
     if args.dicom:
-        config.data.dataset_type = 'dicom_fbp'
+        config.data.dataset_type = 'dicom_sino'
     if args.dicom_path:
         config.data.dicom_path = args.dicom_path
-    if config.data.dataset_type == 'dicom_fbp':
+    if config.data.dataset_type in ('dicom_fbp', 'dicom_sino'):
         # Count all .dcm files across all series in the directory — matches
         # _load_dicom_series which concatenates every series (1 file = 1 slice)
         from pathlib import Path as _Path
@@ -228,7 +230,7 @@ def main():
     
     # Create dataloaders
     print("\n📊 Creating dataloaders...")
-    dataloaders = create_dataloaders_from_config(config, mode=config.data.dataset_type if config.data.dataset_type == 'dicom_fbp' else 'diffusion')
+    dataloaders = create_dataloaders_from_config(config, mode=config.data.dataset_type)
     train_loader = dataloaders['train']
     valid_loader = dataloaders['valid']
     

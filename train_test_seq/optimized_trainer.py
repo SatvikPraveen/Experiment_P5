@@ -154,38 +154,40 @@ class OptimizedSequentialTrainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        
+        # FIX: track raw backward() calls so the final-flush condition is correct
+        pending_steps = 0
+
         progress_bar = tqdm(
             enumerate(self.train_loader),
             total=len(self.train_loader),
             desc=f"Training Epoch {epoch}"
         )
-        
+
         for iteration, batch in progress_bar:
             # Move to device (non-blocking for speed)
             batch = batch.to(self.device, non_blocking=True).float()
-            
+
             b_size = batch.shape[0]
             num_time = batch.shape[1]
             num_velocity = 2
-            
+
             # Downsample once per batch
-            batch = batch.reshape([b_size * num_time, num_velocity, 
-                                   self.config.data.image_height, 
+            batch = batch.reshape([b_size * num_time, num_velocity,
+                                   self.config.data.image_height,
                                    self.config.data.image_width])
             batch_coarse = self.down_sampler(batch).reshape([
                 b_size, num_time, num_velocity,
                 self.config.model.coarse_dim[0],
                 self.config.model.coarse_dim[1]
             ])
-            
+
             batch_coarse_flatten = batch_coarse.reshape([
                 b_size, num_time,
                 num_velocity * self.config.model.coarse_dim[0] * self.config.model.coarse_dim[1]
             ])
-            
+
             assert num_time == self.config.model.n_ctx + 1
-            
+
             # Training within sequence
             for j in range(num_time - self.config.model.n_ctx):
                 # Forward pass with mixed precision
@@ -194,15 +196,16 @@ class OptimizedSequentialTrainer:
                     xnp1, _, _, _ = self.model(inputs_embeds=xn, past=None)
                     xn_label = batch_coarse_flatten[:, j+1:j+1+self.config.model.n_ctx, :]
                     loss = self.criterion(xnp1, xn_label)
-                    
+
                     # Scale loss for gradient accumulation
                     loss = loss / self.accumulation_steps
-                
+
                 # Backward pass
                 self.scaler.scale(loss).backward()
-                
+                pending_steps += 1  # FIX: count actual backward() calls
+
                 # Optimizer step every N accumulation steps
-                if (j + 1) % self.accumulation_steps == 0:
+                if pending_steps % self.accumulation_steps == 0:
                     # Gradient clipping
                     if self.config.training.grad_clip_enabled:
                         self.scaler.unscale_(self.optimizer)
@@ -210,25 +213,31 @@ class OptimizedSequentialTrainer:
                             self.model.parameters(),
                             self.config.training.max_grad_norm
                         )
-                    
+
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
-                    
+
                     total_loss += loss.item() * self.accumulation_steps
                     num_batches += 1
-            
+
             # Update progress bar
             if num_batches > 0:
                 avg_loss = total_loss / num_batches
                 progress_bar.set_postfix({'loss': f'{avg_loss:.6f}'})
-        
-        # Final step if needed
-        if num_batches % self.accumulation_steps != 0:
+
+        # FIX: flush any remaining accumulated gradients from the last partial window
+        if pending_steps % self.accumulation_steps != 0:
+            if self.config.training.grad_clip_enabled:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.training.max_grad_norm
+                )
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-        
+
         return total_loss / max(num_batches, 1)
     
     @torch.no_grad()
@@ -276,7 +285,54 @@ class OptimizedSequentialTrainer:
                 num_batches += 1
         
         return total_loss / max(num_batches, 1)
-    
+
+    @torch.no_grad()
+    def validate_mre(self, loader):
+        """
+        Compute (max_mre, mean_mre) over the validation set.
+
+        Used for curriculum advancement — matches the original train_seq.py
+        logic which advanced Nt when max_mre < march_tol OR
+        mean_mre < march_tol * 0.1.
+        MRE is dimensionless so march_tol=0.01 is always meaningful.
+        """
+        self.model.eval()
+        all_mre = []
+
+        for batch in loader:
+            batch = batch.to(self.device, non_blocking=True).float()
+
+            b_size = batch.shape[0]
+            num_time = batch.shape[1]
+            num_velocity = 2
+
+            batch = batch.reshape([b_size * num_time, num_velocity,
+                                   self.config.data.image_height,
+                                   self.config.data.image_width])
+            batch_coarse = self.down_sampler(batch).reshape([
+                b_size, num_time, num_velocity,
+                self.config.model.coarse_dim[0],
+                self.config.model.coarse_dim[1]
+            ])
+            batch_coarse_flatten = batch_coarse.reshape([
+                b_size, num_time,
+                num_velocity * self.config.model.coarse_dim[0] * self.config.model.coarse_dim[1]
+            ])
+
+            for j in range(min(5, num_time - self.config.model.n_ctx)):
+                xn = batch_coarse_flatten[:, j:j+self.config.model.n_ctx, :]
+                xnp1, _, _, _ = self.model(inputs_embeds=xn, past=None)
+                xn_label = batch_coarse_flatten[:, j+1:j+1+self.config.model.n_ctx, :]
+                rel_err = (
+                    torch.abs(xnp1 - xn_label) /
+                    (torch.abs(xn_label) + 1e-8)
+                ).mean().item()
+                all_mre.append(rel_err)
+
+        if not all_mre:
+            return float('inf'), float('inf')
+        return max(all_mre), sum(all_mre) / len(all_mre)
+
     def train(self):
         """
         Main training loop with curriculum learning.
@@ -305,9 +361,12 @@ class OptimizedSequentialTrainer:
             # Validate
             if epoch % self.config.training.eval_every == 0:
                 valid_loss = self.validate(self.valid_loader)
+                # FIX: use dimensionless MRE for curriculum advancement, not raw MSE
+                max_mre, mean_mre = self.validate_mre(self.valid_loader)
             else:
                 valid_loss = None
-            
+                max_mre, mean_mre = None, None
+
             # Logging
             self.logger.on_epoch_end(
                 epoch=epoch,
@@ -316,9 +375,11 @@ class OptimizedSequentialTrainer:
                 scheduler=self.scheduler,
                 train_loss=train_loss,
                 valid_loss=valid_loss,
-                extra_metrics={'Nt': self.current_Nt}
+                extra_metrics={'Nt': self.current_Nt,
+                               'max_mre': max_mre,
+                               'mean_mre': mean_mre}
             )
-            
+
             # Wandb logging
             if self.wandb_run is not None:
                 log_dict = {
@@ -329,13 +390,19 @@ class OptimizedSequentialTrainer:
                 }
                 if valid_loss is not None:
                     log_dict['valid_loss'] = valid_loss
+                if max_mre is not None:
+                    log_dict['max_mre'] = max_mre
+                    log_dict['mean_mre'] = mean_mre
                 self.wandb_run.log(log_dict)
-            
-            # Curriculum learning check
-            if valid_loss is not None and valid_loss < self.config.training.march_tol:
-                if self.current_Nt < self.config.model.n_ctx:
-                    self.current_Nt += self.config.training.d_Nt
-                    print(f"\n📈 Advancing curriculum to Nt={self.current_Nt}\n")
+
+            # FIX: curriculum advancement uses MRE (dimensionless), matching original
+            # train_seq.py: advance when max_mre < march_tol OR mean_mre < march_tol*0.1
+            if max_mre is not None:
+                if (max_mre < self.config.training.march_tol or
+                        mean_mre < self.config.training.march_tol * 0.1):
+                    if self.current_Nt < self.config.model.n_ctx:
+                        self.current_Nt += self.config.training.d_Nt
+                        print(f"\n📈 Advancing curriculum to Nt={self.current_Nt}\n")
             
             # Step scheduler
             if self.scheduler is not None:
