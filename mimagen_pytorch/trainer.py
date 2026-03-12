@@ -357,9 +357,11 @@ class ImagenTrainer(nn.Module):
 
             if exists(unet_warmup_steps):
                 warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_period = unet_warmup_steps)
-
-                if not exists(scheduler):
-                    scheduler = LambdaLR(optimizer, lr_lambda = lambda step: 1.0)
+                # NOTE: Do NOT create a LambdaLR here. pytorch_warmup.LinearWarmup.__init__
+                # already damps the optimizer lr to near-zero via dampen(step=0). If LambdaLR
+                # is created afterwards it captures that tiny value as its base_lr, permanently
+                # corrupting warmup.self.lrs from 1e-4 → 1e-7 (1000× too small). The update()
+                # loop already handles scheduler=None correctly when only warmup is in use.
 
             # set on object
 
