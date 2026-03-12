@@ -20,6 +20,9 @@ pydicom>=2.3.0
 pillow>=9.5.0
 opencv-python>=4.7.0
 
+# Metrics
+scikit-image>=0.21.0
+
 # Visualization & Monitoring
 matplotlib>=3.7.0
 seaborn>=0.12.0

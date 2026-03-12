@@ -44,6 +44,8 @@ def parse_args():
                         help='Save generated samples')
     parser.add_argument('--cond_scale', type=float, default=1.0,
                         help='Conditioning scale for sampling')
+    parser.add_argument('--gen_batch_size', type=int, default=1,
+                        help='Batch size during generation (reduce if OOM)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use')
     return parser.parse_args()
@@ -85,7 +87,7 @@ def load_model(checkpoint_path, config):
     return imagen
 
 
-def generate_samples(imagen, cond_images, device, cond_scale=1.0):
+def generate_samples(imagen, cond_images, device, cond_scale=1.0, gen_batch_size=1):
     """
     Generate samples conditioned on sinogram images.
     
@@ -97,10 +99,10 @@ def generate_samples(imagen, cond_images, device, cond_scale=1.0):
     imagen.to(device)
     cond_images = cond_images.to(device)
     
-    print(f"\nGenerating {cond_images.shape[0]} samples (cond_scale={cond_scale})...")
+    print(f"\nGenerating {cond_images.shape[0]} samples (cond_scale={cond_scale}, gen_batch_size={gen_batch_size})...")
     
     all_samples = []
-    batch_size = min(4, cond_images.shape[0])
+    batch_size = min(gen_batch_size, cond_images.shape[0])
     
     # T is the time/frame dimension in (B, C, T, H, W)
     video_frames = cond_images.shape[2]
@@ -228,10 +230,6 @@ def main():
     print(f"Loading config from {args.config}")
     config = ExperimentConfig.load(args.config)
     config.training.device = args.device
-
-    # The training code splits the image horizontally (left=cond, right=target),
-    # so the model only ever saw width // 2. Override image_width to match.
-    config.data.image_width = config.data.image_width // 2
     
     # Load model
     print("\n" + "="*70)
@@ -249,15 +247,41 @@ def main():
     dataloaders = create_dataloaders_from_config(config, mode=mode)
     dataloader = dataloaders['valid'] if args.split == 'valid' else dataloaders['train']
     
-    # Collect batches — apply same preprocessing as training
+    # Collect batches — apply same sparse-angle masking as training
+    sparse_strategy = getattr(config.data, 'sparse_strategy', 'angle_25pct')
     cond_list, target_list = [], []
     for batch in dataloader:
         batch = batch.float()
         if batch.dim() == 4:          # (B, C, H, W) → (B, 1, C, H, W)
             batch = batch.unsqueeze(1)
-        H, W = batch.shape[-2], batch.shape[-1]
-        cond   = batch[..., :W//2].permute(0, 2, 1, 3, 4)   # (B,C,T,H,W/2)
-        target = batch[..., W//2:].permute(0, 2, 1, 3, 4)   # (B,C,T,H,W/2)
+        # Pad H to multiple of 16 (mirrors training _pad_h16)
+        B_, T_, C_, H_, W_ = batch.shape
+        pad_h = (16 - H_ % 16) % 16
+        if pad_h > 0:
+            import torch.nn.functional as _F
+            batch = batch.reshape(B_ * T_, C_, H_, W_)
+            batch = _F.pad(batch, (0, 0, 0, pad_h), mode='reflect')
+            batch = batch.reshape(B_, T_, C_, H_ + pad_h, W_)
+        # Build angle-masked condition (same as _apply_sparse_split in trainer)
+        H_pad = batch.shape[-2]
+        batch_target = batch
+        batch_cond = torch.zeros_like(batch_target)
+        if sparse_strategy == 'angle_25pct':
+            cond_indices = list(range(0, H_, 4))
+        elif sparse_strategy == 'angle_12pct':
+            cond_indices = list(range(0, H_, 8))
+        elif sparse_strategy == 'angle_block_50pct':
+            cond_indices = list(range(0, H_ // 2))
+        elif sparse_strategy == 'angle_step_50pct':
+            cond_indices = list(range(0, H_, 2))
+        elif sparse_strategy == 'angle_limited_25pct':
+            cond_indices = list(range(0, int(H_ * 0.75), 4))
+        else:
+            cond_indices = list(range(0, H_, 4))
+        batch_cond[..., cond_indices, :] = batch_target[..., cond_indices, :]
+        # Permute to [B, C, T, H, W]
+        cond   = batch_cond.permute(0, 2, 1, 3, 4)
+        target = batch_target.permute(0, 2, 1, 3, 4)
         cond_list.append(cond)
         target_list.append(target)
         if sum(c.shape[0] for c in cond_list) >= args.num_samples:
@@ -272,7 +296,7 @@ def main():
     print("GENERATING SAMPLES")
     print("="*70)
     try:
-        generated = generate_samples(imagen, cond_all, args.device, args.cond_scale)
+        generated = generate_samples(imagen, cond_all, args.device, args.cond_scale, args.gen_batch_size)
     except Exception as e:
         print(f"\n❌ Error during generation: {e}")
         raise
