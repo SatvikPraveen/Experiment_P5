@@ -249,6 +249,7 @@ def main():
     
     # Collect batches — apply same sparse-angle masking as training
     sparse_strategy = getattr(config.data, 'sparse_strategy', 'angle_25pct')
+    cond_indices = []  # populated inside loop; identical for every batch
     cond_list, target_list = [], []
     for batch in dataloader:
         batch = batch.float()
@@ -304,38 +305,67 @@ def main():
     # Squeeze time dim for metrics: (B, C, T, H, W) → (B, C, H, W)
     generated_np = generated[:, :, 0] if generated.ndim == 5 else generated
     targets_np   = target_all.numpy()[:, :, 0] if target_all.ndim == 5 else target_all.numpy()
-    
-    # Metrics
+
+    # Merged sinogram: replace the known condition rows in the model output
+    # with the exact ground-truth values.  The diffusion model only needs to
+    # invent the missing rows; the provided rows are guaranteed correct.
+    generated_merged = generated_np.copy()
+    if cond_indices:
+        generated_merged[..., cond_indices, :] = targets_np[..., cond_indices, :]
+
+    # Metrics — report both raw output and merged (condition rows restored)
     print("\n" + "="*70)
-    print("METRICS")
+    print("METRICS  (raw model output vs ground truth)")
     print("="*70)
-    metrics = compute_metrics(generated_np, targets_np)
-    print(f"Samples : {metrics['num_samples']}")
-    print(f"MSE     : {metrics['mse']:.6f}")
-    print(f"MAE     : {metrics['mae']:.6f}")
-    print(f"RMSE    : {metrics['rmse']:.6f}")
-    print(f"PSNR    : {metrics['psnr']:.2f} dB")
-    if metrics['ssim'] is not None:
-        print(f"SSIM    : {metrics['ssim']:.4f}")
+    metrics_raw = compute_metrics(generated_np, targets_np)
+    print(f"Samples : {metrics_raw['num_samples']}")
+    print(f"MSE     : {metrics_raw['mse']:.6f}")
+    print(f"MAE     : {metrics_raw['mae']:.6f}")
+    print(f"RMSE    : {metrics_raw['rmse']:.6f}")
+    print(f"PSNR    : {metrics_raw['psnr']:.2f} dB")
+    if metrics_raw['ssim'] is not None:
+        print(f"SSIM    : {metrics_raw['ssim']:.4f}")
+    else:
+        print("SSIM    : N/A (install scikit-image)")
+
+    print("\n" + "="*70)
+    print("METRICS  (merged: condition rows restored from ground truth)")
+    print("="*70)
+    metrics_merged = compute_metrics(generated_merged, targets_np)
+    print(f"Samples : {metrics_merged['num_samples']}")
+    print(f"MSE     : {metrics_merged['mse']:.6f}")
+    print(f"MAE     : {metrics_merged['mae']:.6f}")
+    print(f"RMSE    : {metrics_merged['rmse']:.6f}")
+    print(f"PSNR    : {metrics_merged['psnr']:.2f} dB")
+    if metrics_merged['ssim'] is not None:
+        print(f"SSIM    : {metrics_merged['ssim']:.4f}")
     else:
         print("SSIM    : N/A (install scikit-image)")
     print("="*70 + "\n")
+
+    # Use merged result as the primary metric object for saving
+    metrics = metrics_merged
     
     # Save results
     if args.save_samples:
         output_dir = Path(args.checkpoint).parent / 'eval_results'
         output_dir.mkdir(exist_ok=True)
         
-        np.save(output_dir / f'generated_{args.split}.npy',  generated_np)
-        np.save(output_dir / f'targets_{args.split}.npy',    targets_np)
-        np.save(output_dir / f'cond_{args.split}.npy',       cond_all.numpy()[:, :, 0])
-        
+        np.save(output_dir / f'generated_raw_{args.split}.npy',    generated_np)
+        np.save(output_dir / f'generated_merged_{args.split}.npy', generated_merged)
+        np.save(output_dir / f'targets_{args.split}.npy',           targets_np)
+        np.save(output_dir / f'cond_{args.split}.npy',              cond_all.numpy()[:, :, 0])
+
         with open(output_dir / f'metrics_{args.split}.txt', 'w') as f:
-            for key, value in metrics.items():
+            f.write("--- raw model output ---\n")
+            for key, value in metrics_raw.items():
                 f.write(f"{key}: {value}\n")
-        
+            f.write("\n--- merged (condition rows restored) ---\n")
+            for key, value in metrics_merged.items():
+                f.write(f"{key}: {value}\n")
+
         viz_path = output_dir / f'samples_viz_{args.split}.png'
-        visualize_samples(generated_np, targets_np, viz_path)
+        visualize_samples(generated_merged, targets_np, viz_path)
         
         print(f"Results saved to {output_dir}")
 
