@@ -312,6 +312,11 @@ def main():
     generated_merged = generated_np.copy()
     if cond_indices:
         generated_merged[..., cond_indices, :] = targets_np[..., cond_indices, :]
+        diff_before = np.abs(generated_np[..., cond_indices, :] - targets_np[..., cond_indices, :]).mean()
+        diff_after  = np.abs(generated_merged[..., cond_indices, :] - targets_np[..., cond_indices, :]).mean()
+        print(f"\n✅ MERGE CHECK — {len(cond_indices)} condition rows out of {generated_np.shape[-2]}")
+        print(f"   mean |diff| on cond rows BEFORE merge : {diff_before:.6f}")
+        print(f"   mean |diff| on cond rows AFTER  merge : {diff_after:.6f}  (should be 0.0)\n")
 
     # Metrics — report both raw output and merged (condition rows restored)
     print("\n" + "="*70)
