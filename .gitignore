@@ -79,3 +79,5 @@ slurm-*.out
 reproducibility_results_*/
 wandb
 test_run/
+
+data_1/
