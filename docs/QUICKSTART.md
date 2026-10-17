@@ -325,7 +325,7 @@ CUDA_VISIBLE_DEVICES=0,1 python train_sequential.py --multi_gpu
 
 ## ✅ Checklist for First Run
 
-- [ ] Python 3.9+ installed
+- [ ] Python 3.10+ installed
 - [ ] CUDA and PyTorch working (`python -c "import torch; print(torch.cuda.is_available())"`)
 - [ ] Dependencies installed (`pip install -r requirements.txt`)
 - [ ] Data paths configured (check `configs/base_config.py`)

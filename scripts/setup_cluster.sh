@@ -13,8 +13,8 @@ echo ""
 echo "1. Checking Python version..."
 PYTHON_VERSION=$(python --version 2>&1 | awk '{print $2}')
 echo "   Python version: $PYTHON_VERSION"
-if [[ ! "$PYTHON_VERSION" =~ ^3\.(9|10|11) ]]; then
-    echo "   ⚠️  Warning: Python 3.9-3.11 recommended"
+if [[ ! "$PYTHON_VERSION" =~ ^3\.1[0-9]\. ]]; then
+    echo "   ⚠️  Warning: Python 3.10 or newer required"
 fi
 echo ""
 
